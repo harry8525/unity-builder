@@ -331,6 +331,7 @@ class BuildParameters {
             kubeConfig: cloud_runner_options_1.default.kubeConfig,
             containerMemory: cloud_runner_options_1.default.containerMemory,
             containerCpu: cloud_runner_options_1.default.containerCpu,
+            containerNamespace: cloud_runner_options_1.default.containerNamespace,
             kubeVolumeSize: cloud_runner_options_1.default.kubeVolumeSize,
             kubeVolume: cloud_runner_options_1.default.kubeVolume,
             postBuildContainerHooks: cloud_runner_options_1.default.postBuildContainerHooks,
@@ -1266,6 +1267,9 @@ class CloudRunnerOptions {
     }
     static get containerMemory() {
         return CloudRunnerOptions.getInput('containerMemory') || `3072`;
+    }
+    static get containerNamespace() {
+        return CloudRunnerOptions.getInput('containerNamespace') || `default`;
     }
     static get customJob() {
         return CloudRunnerOptions.getInput('customJob') || '';
@@ -3562,7 +3566,6 @@ const remote_client_logger_1 = __nccwpck_require__(59412);
 const kubernetes_role_1 = __nccwpck_require__(88231);
 const cloud_runner_system_1 = __nccwpck_require__(4197);
 class Kubernetes {
-    // eslint-disable-next-line no-unused-vars
     constructor(buildParameters) {
         this.buildGuid = '';
         this.pvcName = '';
@@ -3580,7 +3583,7 @@ class Kubernetes {
         this.kubeClientApps = this.kubeConfig.makeApiClient(k8s.AppsV1Api);
         this.kubeClientBatch = this.kubeConfig.makeApiClient(k8s.BatchV1Api);
         this.rbacAuthorizationV1Api = this.kubeConfig.makeApiClient(k8s.RbacAuthorizationV1Api);
-        this.namespace = 'default';
+        this.namespace = buildParameters.containerNamespace ? buildParameters.containerNamespace : 'default';
         cloud_runner_logger_1.default.log('Loaded default Kubernetes configuration for this environment');
     }
     async PushLogUpdate(logs) {
@@ -4281,8 +4284,8 @@ class KubernetesTaskRunner {
             cloud_runner_logger_1.default.log(`Streaming logs from pod: ${podName} container: ${containerName} namespace: ${namespace} ${cloud_runner_1.default.buildParameters.kubeVolumeSize}/${cloud_runner_1.default.buildParameters.containerCpu}/${cloud_runner_1.default.buildParameters.containerMemory}`);
             let extraFlags = ``;
             extraFlags += (await kubernetes_pods_1.default.IsPodRunning(podName, namespace, kubeClient))
-                ? ` -f -c ${containerName}`
-                : ` --previous`;
+                ? ` -f -c ${containerName} -n ${namespace}`
+                : ` --previous -n ${namespace}`;
             const callback = (outputChunk) => {
                 output += outputChunk;
                 // split output chunk and handle per line
