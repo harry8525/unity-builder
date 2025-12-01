@@ -5957,6 +5957,7 @@ const client_s3_1 = __nccwpck_require__(19250);
 const aws_client_factory_1 = __nccwpck_require__(30161);
 const node_util_1 = __nccwpck_require__(47261);
 const node_child_process_1 = __nccwpck_require__(17718);
+const k8s_1 = __importDefault(__nccwpck_require__(21613));
 const exec = (0, node_util_1.promisify)(node_child_process_1.exec);
 class SharedWorkspaceLocking {
     static get s3() {
@@ -5969,16 +5970,93 @@ class SharedWorkspaceLocking {
     static get useRclone() {
         return cloud_runner_1.default.buildParameters.storageProvider === 'rclone';
     }
+    static get useK8s() {
+        return cloud_runner_1.default.buildParameters.providerStrategy === 'k8s';
+    }
+    static get kubeClient() {
+        if (cloud_runner_1.default.Provider instanceof k8s_1.default) {
+            return cloud_runner_1.default.Provider.kubeClient;
+        }
+    }
+    static get namespace() {
+        if (cloud_runner_1.default.Provider instanceof k8s_1.default) {
+            return cloud_runner_1.default.Provider.namespace;
+        }
+        return 'default';
+    }
     static async rclone(command) {
         const { stdout } = await exec(`rclone ${command}`);
         return stdout.toString();
     }
+    static get configMapName() {
+        return `unity-builder-locks`;
+    }
+    static async getK8sConfigMap() {
+        if (!SharedWorkspaceLocking.useK8s || !SharedWorkspaceLocking.kubeClient) {
+            return;
+        }
+        try {
+            const response = await SharedWorkspaceLocking.kubeClient.readNamespacedConfigMap(SharedWorkspaceLocking.configMapName, SharedWorkspaceLocking.namespace);
+            return response.body;
+        }
+        catch (error) {
+            if (error.response?.statusCode === 404) {
+                return;
+            }
+            throw error;
+        }
+    }
+    static async ensureK8sConfigMap() {
+        if (!SharedWorkspaceLocking.useK8s || !SharedWorkspaceLocking.kubeClient) {
+            return;
+        }
+        const existing = await SharedWorkspaceLocking.getK8sConfigMap();
+        if (!existing) {
+            const configMap = {
+                apiVersion: 'v1',
+                kind: 'ConfigMap',
+                metadata: {
+                    name: SharedWorkspaceLocking.configMapName,
+                },
+                data: {},
+            };
+            await SharedWorkspaceLocking.kubeClient.createNamespacedConfigMap(SharedWorkspaceLocking.namespace, configMap);
+        }
+    }
+    static async updateK8sConfigMap(data) {
+        if (!SharedWorkspaceLocking.useK8s || !SharedWorkspaceLocking.kubeClient) {
+            return;
+        }
+        await SharedWorkspaceLocking.ensureK8sConfigMap();
+        const configMap = {
+            apiVersion: 'v1',
+            kind: 'ConfigMap',
+            metadata: {
+                name: SharedWorkspaceLocking.configMapName,
+            },
+            data,
+        };
+        await SharedWorkspaceLocking.kubeClient.replaceNamespacedConfigMap(SharedWorkspaceLocking.configMapName, SharedWorkspaceLocking.namespace, configMap);
+    }
+    static async listK8sPVCs() {
+        if (!SharedWorkspaceLocking.useK8s || !SharedWorkspaceLocking.kubeClient) {
+            return [];
+        }
+        const response = await SharedWorkspaceLocking.kubeClient.listNamespacedPersistentVolumeClaim(SharedWorkspaceLocking.namespace);
+        return response.body.items.map((pvc) => pvc.metadata?.name || '').filter((name) => name !== '');
+    }
     static get bucket() {
+        if (SharedWorkspaceLocking.useK8s) {
+            return SharedWorkspaceLocking.configMapName;
+        }
         return SharedWorkspaceLocking.useRclone
             ? cloud_runner_1.default.buildParameters.rcloneRemote
             : cloud_runner_1.default.buildParameters.awsStackName;
     }
     static get workspaceBucketRoot() {
+        if (SharedWorkspaceLocking.useK8s) {
+            return `k8s://${SharedWorkspaceLocking.namespace}/${SharedWorkspaceLocking.configMapName}/`;
+        }
         return SharedWorkspaceLocking.useRclone
             ? `${SharedWorkspaceLocking.bucket}/`
             : `s3://${SharedWorkspaceLocking.bucket}/`;
@@ -5991,6 +6069,10 @@ class SharedWorkspaceLocking {
     }
     static async ensureBucketExists() {
         const bucket = SharedWorkspaceLocking.bucket;
+        if (SharedWorkspaceLocking.useK8s) {
+            await SharedWorkspaceLocking.ensureK8sConfigMap();
+            return;
+        }
         if (SharedWorkspaceLocking.useRclone) {
             try {
                 await SharedWorkspaceLocking.rclone(`lsf ${bucket}`);
@@ -6005,11 +6087,11 @@ class SharedWorkspaceLocking {
         }
         catch {
             const region = input_1.default.region || process.env.AWS_REGION || process.env.AWS_DEFAULT_REGION || 'us-east-1';
-            const createParams = { Bucket: bucket };
+            const createParameters = { Bucket: bucket };
             if (region && region !== 'us-east-1') {
-                createParams.CreateBucketConfiguration = { LocationConstraint: region };
+                createParameters.CreateBucketConfiguration = { LocationConstraint: region };
             }
-            await SharedWorkspaceLocking.s3.send(new client_s3_1.CreateBucketCommand(createParams));
+            await SharedWorkspaceLocking.s3.send(new client_s3_1.CreateBucketCommand(createParameters));
         }
     }
     static async listObjects(prefix, bucket = SharedWorkspaceLocking.bucket) {
@@ -6017,12 +6099,41 @@ class SharedWorkspaceLocking {
         if (prefix !== '' && !prefix.endsWith('/')) {
             prefix += '/';
         }
+        if (SharedWorkspaceLocking.useK8s) {
+            const configMap = await SharedWorkspaceLocking.getK8sConfigMap();
+            if (!configMap || !configMap.data) {
+                return [];
+            }
+            const entries = [];
+            // Keys in ConfigMap represent the full path, filter by prefix
+            for (const key of Object.keys(configMap.data)) {
+                if (key.startsWith(prefix)) {
+                    const relative = key.slice(prefix.length);
+                    if (relative) {
+                        // Extract immediate children only
+                        const slashIndex = relative.indexOf('/');
+                        if (slashIndex === -1) {
+                            // It's a file
+                            entries.push(relative);
+                        }
+                        else {
+                            // It's a directory
+                            const directory = relative.slice(0, slashIndex + 1);
+                            if (!entries.includes(directory)) {
+                                entries.push(directory);
+                            }
+                        }
+                    }
+                }
+            }
+            return entries;
+        }
         if (SharedWorkspaceLocking.useRclone) {
             const path = `${bucket}/${prefix}`;
             try {
                 const output = await SharedWorkspaceLocking.rclone(`lsjson ${path}`);
                 const json = JSON.parse(output);
-                return json.map((e) => (e.IsDir ? `${e.Name}/` : e.Name));
+                return json.map((entry) => (entry.IsDir ? `${entry.Name}/` : entry.Name));
             }
             catch {
                 return [];
@@ -6048,6 +6159,45 @@ class SharedWorkspaceLocking {
             .map((x) => x.replace(`/`, ``))
             .filter((x) => x.endsWith(`_workspace`))
             .map((x) => x.split(`_`)[1]);
+    }
+    static async GetAllPVCsWithLockStatus(buildParametersContext) {
+        if (!SharedWorkspaceLocking.useK8s) {
+            return [];
+        }
+        const allPVCs = await SharedWorkspaceLocking.listK8sPVCs();
+        const workspaces = await SharedWorkspaceLocking.GetAllWorkspaces(buildParametersContext);
+        const result = [];
+        for (const pvcName of allPVCs) {
+            // Check if this PVC matches any workspace pattern
+            const matchingWorkspace = workspaces.find((ws) => pvcName.includes(ws));
+            if (matchingWorkspace) {
+                const isLocked = await SharedWorkspaceLocking.IsWorkspaceLocked(matchingWorkspace, buildParametersContext);
+                let lockedBy;
+                if (isLocked) {
+                    const locks = await SharedWorkspaceLocking.GetAllLocksForWorkspace(matchingWorkspace, buildParametersContext);
+                    if (locks.length > 0) {
+                        // Extract runId from lock name (format: timestamp_runId_workspace_lock)
+                        const lockParts = locks[0].split('_');
+                        if (lockParts.length >= 2) {
+                            lockedBy = lockParts[1];
+                        }
+                    }
+                }
+                result.push({
+                    name: pvcName,
+                    isLocked,
+                    lockedBy,
+                });
+            }
+            else {
+                // PVC doesn't match any known workspace
+                result.push({
+                    name: pvcName,
+                    isLocked: false,
+                });
+            }
+        }
+        return result;
     }
     static async DoesCacheKeyTopLevelExist(buildParametersContext) {
         try {
@@ -6180,7 +6330,13 @@ class SharedWorkspaceLocking {
         const timestamp = Date.now();
         const key = `${SharedWorkspaceLocking.workspacePrefix}${buildParametersContext.cacheKey}/${timestamp}_${workspace}_workspace`;
         await SharedWorkspaceLocking.ensureBucketExists();
-        if (SharedWorkspaceLocking.useRclone) {
+        if (SharedWorkspaceLocking.useK8s) {
+            const configMap = await SharedWorkspaceLocking.getK8sConfigMap();
+            const data = configMap?.data || {};
+            data[key] = timestamp.toString();
+            await SharedWorkspaceLocking.updateK8sConfigMap(data);
+        }
+        else if (SharedWorkspaceLocking.useRclone) {
             await SharedWorkspaceLocking.rclone(`touch ${SharedWorkspaceLocking.bucket}/${key}`);
         }
         else {
@@ -6200,7 +6356,13 @@ class SharedWorkspaceLocking {
         const ending = existingWorkspace ? workspace : `${workspace}_workspace`;
         const key = `${SharedWorkspaceLocking.workspacePrefix}${buildParametersContext.cacheKey}/${Date.now()}_${runId}_${ending}_lock`;
         await SharedWorkspaceLocking.ensureBucketExists();
-        if (SharedWorkspaceLocking.useRclone) {
+        if (SharedWorkspaceLocking.useK8s) {
+            const configMap = await SharedWorkspaceLocking.getK8sConfigMap();
+            const data = configMap?.data || {};
+            data[key] = `${runId}_${Date.now()}`;
+            await SharedWorkspaceLocking.updateK8sConfigMap(data);
+        }
+        else if (SharedWorkspaceLocking.useRclone) {
             await SharedWorkspaceLocking.rclone(`touch ${SharedWorkspaceLocking.bucket}/${key}`);
         }
         else {
@@ -6211,7 +6373,13 @@ class SharedWorkspaceLocking {
             cloud_runner_1.default.lockedWorkspace = workspace;
         }
         else {
-            if (SharedWorkspaceLocking.useRclone) {
+            if (SharedWorkspaceLocking.useK8s) {
+                const configMap = await SharedWorkspaceLocking.getK8sConfigMap();
+                const data = configMap?.data || {};
+                delete data[key];
+                await SharedWorkspaceLocking.updateK8sConfigMap(data);
+            }
+            else if (SharedWorkspaceLocking.useRclone) {
                 await SharedWorkspaceLocking.rclone(`delete ${SharedWorkspaceLocking.bucket}/${key}`);
             }
             else {
@@ -6228,7 +6396,14 @@ class SharedWorkspaceLocking {
         cloud_runner_logger_1.default.log(`Deleting lock ${workspace}/${file}`);
         cloud_runner_logger_1.default.log(`rm ${SharedWorkspaceLocking.workspaceRoot}${buildParametersContext.cacheKey}/${file}`);
         if (file) {
-            if (SharedWorkspaceLocking.useRclone) {
+            if (SharedWorkspaceLocking.useK8s) {
+                const configMap = await SharedWorkspaceLocking.getK8sConfigMap();
+                const data = configMap?.data || {};
+                const key = `${SharedWorkspaceLocking.workspacePrefix}${buildParametersContext.cacheKey}/${file}`;
+                delete data[key];
+                await SharedWorkspaceLocking.updateK8sConfigMap(data);
+            }
+            else if (SharedWorkspaceLocking.useRclone) {
                 await SharedWorkspaceLocking.rclone(`delete ${SharedWorkspaceLocking.bucket}/${SharedWorkspaceLocking.workspacePrefix}${buildParametersContext.cacheKey}/${file}`);
             }
             else {
@@ -6244,7 +6419,13 @@ class SharedWorkspaceLocking {
         const prefix = `${SharedWorkspaceLocking.workspacePrefix}${buildParametersContext.cacheKey}/`;
         const files = await SharedWorkspaceLocking.listObjects(prefix);
         for (const file of files.filter((x) => x.includes(`_${workspace}_`))) {
-            if (SharedWorkspaceLocking.useRclone) {
+            if (SharedWorkspaceLocking.useK8s) {
+                const configMap = await SharedWorkspaceLocking.getK8sConfigMap();
+                const data = configMap?.data || {};
+                delete data[`${prefix}${file}`];
+                await SharedWorkspaceLocking.updateK8sConfigMap(data);
+            }
+            else if (SharedWorkspaceLocking.useRclone) {
                 await SharedWorkspaceLocking.rclone(`delete ${SharedWorkspaceLocking.bucket}/${prefix}${file}`);
             }
             else {
