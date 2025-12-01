@@ -5991,6 +5991,27 @@ class SharedWorkspaceLocking {
     static get configMapName() {
         return `unity-builder-locks`;
     }
+    /**
+     * Sanitize cacheKey to be safe for use in paths.
+     * Replaces '/' with '-' to avoid nested directory structures.
+     */
+    static sanitizeCacheKey(cacheKey) {
+        return cacheKey.replace(/\//g, '-');
+    }
+    /**
+     * Encode a path-like key to be valid for Kubernetes ConfigMap keys.
+     * ConfigMap keys must match regex: [-._a-zA-Z0-9]+
+     * We encode '/' as '--' (double dash) since single dash is allowed.
+     */
+    static encodeConfigMapKey(key) {
+        return key.replace(/\//g, '--');
+    }
+    /**
+     * Decode a ConfigMap key back to the original path-like format.
+     */
+    static decodeConfigMapKey(encodedKey) {
+        return encodedKey.replace(/--/g, '/');
+    }
     static async getK8sConfigMap() {
         if (!SharedWorkspaceLocking.useK8s || !SharedWorkspaceLocking.kubeClient) {
             return;
@@ -6105,8 +6126,9 @@ class SharedWorkspaceLocking {
                 return [];
             }
             const entries = [];
-            // Keys in ConfigMap represent the full path, filter by prefix
-            for (const key of Object.keys(configMap.data)) {
+            // Keys in ConfigMap are encoded (/ replaced with --), decode them for comparison
+            for (const encodedKey of Object.keys(configMap.data)) {
+                const key = SharedWorkspaceLocking.decodeConfigMapKey(encodedKey);
                 if (key.startsWith(prefix)) {
                     const relative = key.slice(prefix.length);
                     if (relative) {
@@ -6155,7 +6177,8 @@ class SharedWorkspaceLocking {
         if (!(await SharedWorkspaceLocking.DoesCacheKeyTopLevelExist(buildParametersContext))) {
             return [];
         }
-        return (await SharedWorkspaceLocking.listObjects(`${SharedWorkspaceLocking.workspacePrefix}${buildParametersContext.cacheKey}/`))
+        const sanitizedCacheKey = SharedWorkspaceLocking.sanitizeCacheKey(buildParametersContext.cacheKey);
+        return (await SharedWorkspaceLocking.listObjects(`${SharedWorkspaceLocking.workspacePrefix}${sanitizedCacheKey}/`))
             .map((x) => x.replace(`/`, ``))
             .filter((x) => x.endsWith(`_workspace`))
             .map((x) => x.split(`_`)[1]);
@@ -6205,7 +6228,8 @@ class SharedWorkspaceLocking {
             const lockFolderExists = rootLines.map((x) => x.replace(`/`, ``)).includes(`locks`);
             if (lockFolderExists) {
                 const lines = await SharedWorkspaceLocking.listObjects(SharedWorkspaceLocking.workspacePrefix);
-                return lines.map((x) => x.replace(`/`, ``)).includes(buildParametersContext.cacheKey);
+                const sanitizedCacheKey = SharedWorkspaceLocking.sanitizeCacheKey(buildParametersContext.cacheKey);
+                return lines.map((x) => x.replace(`/`, ``)).includes(sanitizedCacheKey);
             }
             else {
                 return false;
@@ -6222,7 +6246,8 @@ class SharedWorkspaceLocking {
         if (!(await SharedWorkspaceLocking.DoesWorkspaceExist(workspace, buildParametersContext))) {
             return [];
         }
-        return (await SharedWorkspaceLocking.listObjects(`${SharedWorkspaceLocking.workspacePrefix}${buildParametersContext.cacheKey}/`))
+        const sanitizedCacheKey = SharedWorkspaceLocking.sanitizeCacheKey(buildParametersContext.cacheKey);
+        return (await SharedWorkspaceLocking.listObjects(`${SharedWorkspaceLocking.workspacePrefix}${sanitizedCacheKey}/`))
             .map((x) => x.replace(`/`, ``))
             .filter((x) => x.includes(workspace) && x.endsWith(`_lock`));
     }
@@ -6308,7 +6333,8 @@ class SharedWorkspaceLocking {
         if (!(await SharedWorkspaceLocking.DoesWorkspaceExist(workspace, buildParametersContext))) {
             throw new Error("Workspace doesn't exist, can't call get all locks");
         }
-        return (await SharedWorkspaceLocking.listObjects(`${SharedWorkspaceLocking.workspacePrefix}${buildParametersContext.cacheKey}/`))
+        const sanitizedCacheKey = SharedWorkspaceLocking.sanitizeCacheKey(buildParametersContext.cacheKey);
+        return (await SharedWorkspaceLocking.listObjects(`${SharedWorkspaceLocking.workspacePrefix}${sanitizedCacheKey}/`))
             .map((x) => x.replace(`/`, ``))
             .filter((x) => x.includes(workspace) && x.endsWith(`_workspace`))
             .map((x) => Number(x))[0];
@@ -6317,7 +6343,8 @@ class SharedWorkspaceLocking {
         if (!(await SharedWorkspaceLocking.DoesWorkspaceExist(workspace, buildParametersContext))) {
             throw new Error(`workspace doesn't exist ${workspace}`);
         }
-        const files = await SharedWorkspaceLocking.listObjects(`${SharedWorkspaceLocking.workspacePrefix}${buildParametersContext.cacheKey}/`);
+        const sanitizedCacheKey = SharedWorkspaceLocking.sanitizeCacheKey(buildParametersContext.cacheKey);
+        const files = await SharedWorkspaceLocking.listObjects(`${SharedWorkspaceLocking.workspacePrefix}${sanitizedCacheKey}/`);
         const lockFilesExist = files.filter((x) => {
             return x.includes(workspace) && x.endsWith(`_lock`);
         }).length > 0;
@@ -6328,12 +6355,14 @@ class SharedWorkspaceLocking {
             throw new Error(`${workspace} already exists`);
         }
         const timestamp = Date.now();
-        const key = `${SharedWorkspaceLocking.workspacePrefix}${buildParametersContext.cacheKey}/${timestamp}_${workspace}_workspace`;
+        const sanitizedCacheKey = SharedWorkspaceLocking.sanitizeCacheKey(buildParametersContext.cacheKey);
+        const key = `${SharedWorkspaceLocking.workspacePrefix}${sanitizedCacheKey}/${timestamp}_${workspace}_workspace`;
         await SharedWorkspaceLocking.ensureBucketExists();
         if (SharedWorkspaceLocking.useK8s) {
             const configMap = await SharedWorkspaceLocking.getK8sConfigMap();
             const data = configMap?.data || {};
-            data[key] = timestamp.toString();
+            const encodedKey = SharedWorkspaceLocking.encodeConfigMapKey(key);
+            data[encodedKey] = timestamp.toString();
             await SharedWorkspaceLocking.updateK8sConfigMap(data);
         }
         else if (SharedWorkspaceLocking.useRclone) {
@@ -6354,12 +6383,14 @@ class SharedWorkspaceLocking {
     static async LockWorkspace(workspace, runId, buildParametersContext) {
         const existingWorkspace = workspace.endsWith(`_workspace`);
         const ending = existingWorkspace ? workspace : `${workspace}_workspace`;
-        const key = `${SharedWorkspaceLocking.workspacePrefix}${buildParametersContext.cacheKey}/${Date.now()}_${runId}_${ending}_lock`;
+        const sanitizedCacheKey = SharedWorkspaceLocking.sanitizeCacheKey(buildParametersContext.cacheKey);
+        const key = `${SharedWorkspaceLocking.workspacePrefix}${sanitizedCacheKey}/${Date.now()}_${runId}_${ending}_lock`;
         await SharedWorkspaceLocking.ensureBucketExists();
         if (SharedWorkspaceLocking.useK8s) {
             const configMap = await SharedWorkspaceLocking.getK8sConfigMap();
             const data = configMap?.data || {};
-            data[key] = `${runId}_${Date.now()}`;
+            const encodedKey = SharedWorkspaceLocking.encodeConfigMapKey(key);
+            data[encodedKey] = `${runId}_${Date.now()}`;
             await SharedWorkspaceLocking.updateK8sConfigMap(data);
         }
         else if (SharedWorkspaceLocking.useRclone) {
@@ -6376,7 +6407,8 @@ class SharedWorkspaceLocking {
             if (SharedWorkspaceLocking.useK8s) {
                 const configMap = await SharedWorkspaceLocking.getK8sConfigMap();
                 const data = configMap?.data || {};
-                delete data[key];
+                const encodedKey = SharedWorkspaceLocking.encodeConfigMapKey(key);
+                delete data[encodedKey];
                 await SharedWorkspaceLocking.updateK8sConfigMap(data);
             }
             else if (SharedWorkspaceLocking.useRclone) {
@@ -6392,37 +6424,41 @@ class SharedWorkspaceLocking {
         await SharedWorkspaceLocking.ensureBucketExists();
         const files = await SharedWorkspaceLocking.GetAllLocksForWorkspace(workspace, buildParametersContext);
         const file = files.find((x) => x.includes(workspace) && x.endsWith(`_lock`) && x.includes(runId));
+        const sanitizedCacheKey = SharedWorkspaceLocking.sanitizeCacheKey(buildParametersContext.cacheKey);
         cloud_runner_logger_1.default.log(`All Locks ${files} ${workspace} ${runId}`);
         cloud_runner_logger_1.default.log(`Deleting lock ${workspace}/${file}`);
-        cloud_runner_logger_1.default.log(`rm ${SharedWorkspaceLocking.workspaceRoot}${buildParametersContext.cacheKey}/${file}`);
+        cloud_runner_logger_1.default.log(`rm ${SharedWorkspaceLocking.workspaceRoot}${sanitizedCacheKey}/${file}`);
         if (file) {
             if (SharedWorkspaceLocking.useK8s) {
                 const configMap = await SharedWorkspaceLocking.getK8sConfigMap();
                 const data = configMap?.data || {};
-                const key = `${SharedWorkspaceLocking.workspacePrefix}${buildParametersContext.cacheKey}/${file}`;
-                delete data[key];
+                const key = `${SharedWorkspaceLocking.workspacePrefix}${sanitizedCacheKey}/${file}`;
+                const encodedKey = SharedWorkspaceLocking.encodeConfigMapKey(key);
+                delete data[encodedKey];
                 await SharedWorkspaceLocking.updateK8sConfigMap(data);
             }
             else if (SharedWorkspaceLocking.useRclone) {
-                await SharedWorkspaceLocking.rclone(`delete ${SharedWorkspaceLocking.bucket}/${SharedWorkspaceLocking.workspacePrefix}${buildParametersContext.cacheKey}/${file}`);
+                await SharedWorkspaceLocking.rclone(`delete ${SharedWorkspaceLocking.bucket}/${SharedWorkspaceLocking.workspacePrefix}${sanitizedCacheKey}/${file}`);
             }
             else {
                 await SharedWorkspaceLocking.s3.send(new client_s3_1.DeleteObjectCommand({
                     Bucket: SharedWorkspaceLocking.bucket,
-                    Key: `${SharedWorkspaceLocking.workspacePrefix}${buildParametersContext.cacheKey}/${file}`,
+                    Key: `${SharedWorkspaceLocking.workspacePrefix}${sanitizedCacheKey}/${file}`,
                 }));
             }
         }
         return !(await SharedWorkspaceLocking.HasWorkspaceLock(workspace, runId, buildParametersContext));
     }
     static async CleanupWorkspace(workspace, buildParametersContext) {
-        const prefix = `${SharedWorkspaceLocking.workspacePrefix}${buildParametersContext.cacheKey}/`;
+        const sanitizedCacheKey = SharedWorkspaceLocking.sanitizeCacheKey(buildParametersContext.cacheKey);
+        const prefix = `${SharedWorkspaceLocking.workspacePrefix}${sanitizedCacheKey}/`;
         const files = await SharedWorkspaceLocking.listObjects(prefix);
         for (const file of files.filter((x) => x.includes(`_${workspace}_`))) {
             if (SharedWorkspaceLocking.useK8s) {
                 const configMap = await SharedWorkspaceLocking.getK8sConfigMap();
                 const data = configMap?.data || {};
-                delete data[`${prefix}${file}`];
+                const encodedKey = SharedWorkspaceLocking.encodeConfigMapKey(`${prefix}${file}`);
+                delete data[encodedKey];
                 await SharedWorkspaceLocking.updateK8sConfigMap(data);
             }
             else if (SharedWorkspaceLocking.useRclone) {

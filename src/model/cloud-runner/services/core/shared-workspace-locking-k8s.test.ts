@@ -4,6 +4,13 @@ import CloudRunner from '../../cloud-runner';
 import Kubernetes from '../../providers/k8s';
 import * as k8s from '@kubernetes/client-node';
 
+/**
+ * Helper to encode ConfigMap keys (same as the production code)
+ */
+function encodeConfigMapKey(key: string): string {
+  return key.replace(/\//g, '--');
+}
+
 describe('SharedWorkspaceLocking - K8s Provider', () => {
   let buildParameters: BuildParameters;
   let mockKubeClient: jest.Mocked<k8s.CoreV1Api>;
@@ -97,6 +104,160 @@ describe('SharedWorkspaceLocking - K8s Provider', () => {
     });
   });
 
+  describe('ConfigMap Key Encoding for paths with slashes', () => {
+    /**
+     * Kubernetes ConfigMap keys must match regex: [-._a-zA-Z0-9]+
+     * Keys with slashes (/) are encoded by replacing / with --
+     */
+    let configMapData: Record<string, string>;
+
+    beforeEach(() => {
+      configMapData = {};
+
+      mockKubeClient.readNamespacedConfigMap.mockImplementation(async () => {
+        return {
+          body: {
+            metadata: { name: 'unity-builder-locks' },
+            data: configMapData,
+          },
+        } as any;
+      });
+
+      mockKubeClient.replaceNamespacedConfigMap.mockImplementation(async (_name, _namespace, configMap) => {
+        configMapData = configMap.data || {};
+
+        return {} as any;
+      });
+
+      mockKubeClient.createNamespacedConfigMap.mockResolvedValue({} as any);
+    });
+
+    it('should encode keys with slashes when creating workspace', async () => {
+      // Use a cacheKey that contains slashes like "pull/43/merge"
+      const cacheKeyWithSlashes = 'pull/43/merge';
+      const parametersWithSlashes = {
+        ...buildParameters,
+        cacheKey: cacheKeyWithSlashes,
+        maxRetainedWorkspaces: 0,
+      } as BuildParameters;
+      CloudRunner.buildParameters = parametersWithSlashes;
+
+      await SharedWorkspaceLocking.CreateWorkspace('test-workspace', parametersWithSlashes);
+
+      // Verify that the key stored in ConfigMap uses -- instead of / for path separators
+      // and the cacheKey is sanitized (slashes replaced with single dash)
+      const keys = Object.keys(configMapData);
+      expect(keys.length).toBe(1);
+
+      // The key should NOT contain slashes
+      expect(keys[0]).not.toContain('/');
+
+      // The cacheKey part should be sanitized: pull/43/merge -> pull-43-merge
+      // The path separators should be encoded: locks/{sanitized_cacheKey}/... -> locks--{sanitized_cacheKey}--...
+      expect(keys[0]).toContain('locks--pull-43-merge--');
+      expect(keys[0]).toContain('test-workspace_workspace');
+    });
+
+    it('should decode keys when reading workspaces with slashes in cacheKey', async () => {
+      const cacheKeyWithSlashes = 'pull/43/merge';
+      const parametersWithSlashes = {
+        ...buildParameters,
+        cacheKey: cacheKeyWithSlashes,
+        maxRetainedWorkspaces: 0,
+      } as BuildParameters;
+      CloudRunner.buildParameters = parametersWithSlashes;
+
+      // Pre-populate with an encoded key (as if it was created by CreateWorkspace)
+      // cacheKey is sanitized: pull/43/merge -> pull-43-merge
+      // path is encoded: locks/pull-43-merge/... -> locks--pull-43-merge--...
+      const encodedKey = 'locks--pull-43-merge--1000_my-workspace_workspace';
+      configMapData[encodedKey] = '1000';
+
+      const workspaces = await SharedWorkspaceLocking.GetAllWorkspaces(parametersWithSlashes);
+
+      expect(workspaces).toContain('my-workspace');
+    });
+
+    it('should handle locking workspaces with slashes in cacheKey', async () => {
+      const cacheKeyWithSlashes = 'pull/43/merge';
+      const parametersWithSlashes = {
+        ...buildParameters,
+        cacheKey: cacheKeyWithSlashes,
+        maxRetainedWorkspaces: 0,
+      } as BuildParameters;
+      CloudRunner.buildParameters = parametersWithSlashes;
+
+      // Pre-create workspace with encoded key (sanitized cacheKey: pull-43-merge)
+      const workspaceKey = 'locks--pull-43-merge--1000_test-ws_workspace';
+      configMapData[workspaceKey] = '1000';
+
+      await SharedWorkspaceLocking.LockWorkspace('test-ws', 'run-123', parametersWithSlashes);
+
+      // Should have 2 keys now: workspace + lock
+      const keys = Object.keys(configMapData);
+      expect(keys.length).toBe(2);
+
+      // Both keys should use encoded format (no slashes)
+      for (const key of keys) {
+        expect(key).not.toContain('/');
+      }
+
+      // Find the lock key
+      const lockKey = keys.find((k) => k.endsWith('_workspace_lock'));
+      expect(lockKey).toBeDefined();
+      expect(lockKey).toContain('locks--pull-43-merge--');
+      expect(lockKey).toContain('run-123');
+    });
+
+    it('should handle complex cacheKey with multiple path segments', async () => {
+      const complexCacheKey = 'refs/heads/feature/my-feature/build';
+      const parametersWithComplexKey = {
+        ...buildParameters,
+        cacheKey: complexCacheKey,
+        maxRetainedWorkspaces: 0,
+      } as BuildParameters;
+      CloudRunner.buildParameters = parametersWithComplexKey;
+
+      await SharedWorkspaceLocking.CreateWorkspace('workspace-1', parametersWithComplexKey);
+
+      const keys = Object.keys(configMapData);
+      expect(keys.length).toBe(1);
+
+      // Should have no slashes (all encoded)
+      expect(keys[0]).not.toContain('/');
+
+      // cacheKey is sanitized: refs/heads/feature/my-feature/build -> refs-heads-feature-my-feature-build
+      // Path encoded: locks/refs-heads-feature-my-feature-build/... -> locks--refs-heads-feature-my-feature-build--...
+      expect(keys[0]).toContain('locks--refs-heads-feature-my-feature-build--');
+    });
+
+    it('should correctly release lock with slashes in cacheKey', async () => {
+      const cacheKeyWithSlashes = 'pull/99/merge';
+      const parametersWithSlashes = {
+        ...buildParameters,
+        cacheKey: cacheKeyWithSlashes,
+        maxRetainedWorkspaces: 0,
+      } as BuildParameters;
+      CloudRunner.buildParameters = parametersWithSlashes;
+
+      // Pre-create workspace and lock with encoded keys (sanitized cacheKey: pull-99-merge)
+      const workspaceKey = 'locks--pull-99-merge--1000_release-ws_workspace';
+      const lockKey = 'locks--pull-99-merge--2000_release-run_release-ws_workspace_lock';
+      configMapData[workspaceKey] = '1000';
+      configMapData[lockKey] = 'release-run_2000';
+
+      expect(Object.keys(configMapData).length).toBe(2);
+
+      await SharedWorkspaceLocking.ReleaseWorkspace('release-ws', 'release-run', parametersWithSlashes);
+
+      // Lock should be removed, workspace should remain
+      const remainingKeys = Object.keys(configMapData);
+      expect(remainingKeys.length).toBe(1);
+      expect(remainingKeys[0]).toContain('release-ws_workspace');
+      expect(remainingKeys[0]).not.toContain('_lock');
+    });
+  });
+
   describe('Workspace Creation and Reuse with maxRetainedWorkspaces=3', () => {
     let configMapData: Record<string, string>;
     const cacheKey = 'test-cache-key';
@@ -138,7 +299,8 @@ describe('SharedWorkspaceLocking - K8s Provider', () => {
      */
     function addWorkspaceToConfigMap(workspaceName: string, timestamp: number) {
       const key = `locks/${cacheKey}/${timestamp}_${workspaceName}_workspace`;
-      configMapData[key] = timestamp.toString();
+      const encodedKey = encodeConfigMapKey(key);
+      configMapData[encodedKey] = timestamp.toString();
     }
 
     /**
@@ -146,7 +308,8 @@ describe('SharedWorkspaceLocking - K8s Provider', () => {
      */
     function addLockToConfigMap(workspaceName: string, runId: string, timestamp: number) {
       const key = `locks/${cacheKey}/${timestamp}_${runId}_${workspaceName}_workspace_lock`;
-      configMapData[key] = `${runId}_${timestamp}`;
+      const encodedKey = encodeConfigMapKey(key);
+      configMapData[encodedKey] = `${runId}_${timestamp}`;
     }
 
     /**
