@@ -206,6 +206,10 @@ inputs:
     default: ''
     required: false
     description: '[CloudRunner] Namespace the container will be created in'
+  maxRetainedWorkspaces:
+    default: ''
+    required: false
+    description: '[CloudRunner] Maximum number of retained workspaces'
   readInputFromOverrideList:
     default: ''
     required: false
