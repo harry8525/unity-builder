@@ -202,6 +202,10 @@ inputs:
     default: ''
     required: false
     description: '[CloudRunner] Amount of memory to assign the remote build container'
+  containerNamespace:
+    default: ''
+    required: false
+    description: '[CloudRunner] Namespace the container will be created in'
   readInputFromOverrideList:
     default: ''
     required: false
